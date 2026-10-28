@@ -9,6 +9,7 @@ from greeclimate_davo22.mqtt_client import GreeMqttClient
 
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import CONF_SERVER, DOMAIN, GREE_MQTT_SERVERS
 from .coordinator import (
@@ -98,6 +99,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: GreeCloudConfigEntry) ->
     """Set up Gree Climate Cloud from a config entry."""
     _LOGGER.info("Setting up Gree Climate Cloud integration")
 
+    api = None
+    mqtt_client = None
+    coordinators = []
     try:
         # Create Cloud API client
         api = GreeCloudApi.for_server(
@@ -108,7 +112,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: GreeCloudConfigEntry) ->
 
         # Login to cloud
         _LOGGER.debug("Logging in to Gree Cloud")
-        credentials = await api.login()
+        try:
+            credentials = await api.login()
+        except Exception as err:
+            # The cloud rejected the credentials (e.g. a changed password).
+            # Retrying in a loop would only hammer the account, so give up.
+            if str(err).startswith("Login failed"):
+                _LOGGER.error("Gree Cloud rejected the login: %s", err)
+                await _close_quietly(api.close)
+                return False
+            raise
 
         # Create MQTT client
         _LOGGER.debug("Connecting to Gree MQTT broker")
@@ -141,8 +154,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: GreeCloudConfigEntry) ->
         return True
 
     except Exception as err:
-        _LOGGER.exception("Failed to setup Gree Climate Cloud: %s", err)
-        return False
+        # Anything else (the MQTT broker refusing a fresh token, network or
+        # cloud hiccups) is usually transient. Clean up and let Home Assistant
+        # retry the setup instead of leaving the entry failed until someone
+        # reloads it by hand.
+        for coordinator in coordinators:
+            await _close_quietly(coordinator.device.close)
+        if mqtt_client is not None:
+            await _close_quietly(mqtt_client.disconnect)
+        if api is not None:
+            await _close_quietly(api.close)
+        raise ConfigEntryNotReady(f"Gree Cloud setup failed: {err}") from err
+
+
+async def _close_quietly(close) -> None:
+    """Await a close/disconnect coroutine function, ignoring any error."""
+    try:
+        await close()
+    except Exception as err:
+        _LOGGER.debug("Ignoring error during cleanup: %s", err)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: GreeCloudConfigEntry) -> bool:
